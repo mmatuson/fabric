@@ -65,9 +65,10 @@ def rsync_project(remote_dir, local_dir=None, exclude=[], delete=False,
     options_map = {
         "delete"  : '--delete' if delete else '',
         "exclude" : exclude_opts % exclusions,
+        "ssh-port": '--rsh="ssh -p%s"' % env.port,
         "extra"   : extra_opts
     }
-    options = "%(delete)s%(exclude)s -pthrvz %(extra)s" % options_map
+    options = "%(delete)s%(exclude)s -pthrvz %(ssh-port)s %(extra)s" % options_map
     # Get local directory
     if local_dir is None:
         local_dir = '../' + getcwd().split(sep)[-1]
