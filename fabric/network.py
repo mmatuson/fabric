@@ -9,9 +9,15 @@ import threading
 import socket
 import sys
 
-import paramiko as ssh
+from fabric.utils import abort
 
-from utils import abort
+try:
+    import warnings
+    warnings.simplefilter('ignore', DeprecationWarning)
+    import paramiko as ssh
+except ImportError:
+    abort("paramiko is a required module. Please install it:\n\t$ sudo easy_install paramiko")
+
 
 
 host_pattern = r'((?P<user>[^@]+)@)?(?P<host>[^:]+)(:(?P<port>\d+))?'
@@ -70,7 +76,10 @@ def normalize(host_string, omit_port=False):
 
     If ``omit_port`` is given and is True, only the host and user are returned.
     """
-    from state import env
+    from fabric.state import env
+    # Gracefully handle "empty" input by returning empty output
+    if not host_string:
+        return ('', '') if omit_port else ('', '', '')
     # Get user, host and port separately
     r = host_regex.match(host_string).groupdict()
     # Add any necessary defaults in
@@ -245,11 +254,11 @@ def prompt_for_password(previous=None, prompt=None):
     current host being connected to. To override this, specify a string value
     for ``prompt``.
     """
-    from state import env
+    from fabric.state import env
     # Construct the prompt we will display to the user (using host if available)
     if 'host' in env:
-        base_password_prompt = "Password for %s" % join_host_strings(*normalize(
-            env.host_string, omit_port=True))
+        host = join_host_strings(*normalize(env.host_string, omit_port=True))
+        base_password_prompt = "Password for %s" % host
     else:
         base_password_prompt = "Password"
     password_prompt = base_password_prompt
@@ -296,28 +305,41 @@ def output_thread(prefix, chan, stderr=False, capture=None):
             recv = chan.recv
         out = recv(65535)
         while out != '':
-            # Capture if necessary
-            if capture is not None:
-                capture += out
             # Detect password prompts
             initial = re.findall(r'^%s$' % env.sudo_prompt, out, re.I|re.M)
-            try_again = re.findall(r'^Sorry, try again', out, re.I|re.M)
-            # Deal with any such prompts
+            try_again = re.findall(r'^%s' % env.again_prompt, out, re.I|re.M)
+            # Capture if necessary (omitting password prompts so captured
+            # stderr isn't gunked up)
+            if capture is not None:
+                if initial:
+                    out = out.replace(env.sudo_prompt, '')
+                if try_again:
+                    out = out.replace(env.again_prompt, '')
+                capture += out
+            # Deal with password prompts
             if initial or try_again:
                 # Prompt user if nothing to try, or if stored password failed
                 if not password or try_again:
-                    password = prompt_for_password(password)
-                # Set environment password if that was previously empty.
-                if not env.password:
-                    env.password = password
+                    # Save entered password in local and global password var.
+                    # Will have to re-enter when password changes per host, but
+                    # this way a given password will persist for as long as
+                    # it's valid.
+                    env.password = password = prompt_for_password(password)
                 # Send current password down the pipe
                 chan.sendall(password + '\n')
                 out = ""
             # Deal with line breaks, printing all lines and storing the
             # leftovers, if any.
             if '\n' in out or '\r' in out:
+                # Break into list of lines/parts
                 parts = out.splitlines()
+                # Deal with edge case of trailing newline (messes up leftovers
+                # logic due to how splitlines() behaves)
+                if out[-1] in ['\n', '\r']:
+                    parts.append('')
+                # Initialize loop with first line
                 line = leftovers + parts.pop(0)
+                # Take off the last part, since it may be a partial line
                 if parts:
                     leftovers = parts.pop()
                 while parts or line:
@@ -361,10 +383,47 @@ def needs_host(func):
     commands, this decorator will also end up prompting the user once per
     command (in the case where multiple commands have no hosts set, of course.)
     """
-    from state import env
+    from fabric.state import env
     @wraps(func)
     def host_prompting_wrapper(*args, **kwargs):
         while not env.get('host_string', False):
-            env.host_string = raw_input("No hosts found. Please specify (single) host string for connection: ")
+            host_string = raw_input("No hosts found. Please specify (single) host string for connection: ")
+            interpret_host_string(host_string)
         return func(*args, **kwargs)
     return host_prompting_wrapper
+
+
+def interpret_host_string(host_string):
+    """
+    Apply given host string to the env dict.
+
+    Split it into hostname, username and port (using
+    `~fabric.network.normalize`) and store the full host string plus its
+    constituent parts into the appropriate env vars.
+
+    Returns the parts as split out by ``normalize`` for convenience.
+    """
+    from fabric.state import env
+    username, hostname, port = normalize(host_string)
+    env.host_string = host_string
+    env.host = hostname
+    env.user = username
+    env.port = port
+    return username, hostname, port
+
+
+def disconnect_all():
+    """
+    Disconnect from all currently connected servers.
+
+    Used at the end of ``fab``'s main loop, and also intended for use by
+    library users.
+    """
+    from fabric.state import connections, output
+    # Explicitly disconnect from all servers
+    for key in connections.keys():
+        if output.status:
+            print "Disconnecting from %s..." % denormalize(key),
+        connections[key].close()
+        if output.status:
+            print "done."
